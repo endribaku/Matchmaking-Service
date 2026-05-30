@@ -21,36 +21,43 @@ All concurrency lives in [`MatchmakingService.java`](backend/src/main/java/com/m
 
 | Primitive | Where | Purpose |
 |---|---|---|
-| `ExecutorService` (fixed pool) | `ApiServer` (`HttpServer.setExecutor`) | HTTP requests are handled in parallel by 8 worker threads. |
+| `ThreadPoolExecutor` (8 workers) | `ApiServer.httpPool` | HTTP requests are handled in parallel by 8 worker threads. |
 | `LinkedBlockingQueue<QueueTicket>` | `MatchmakingService.incoming` | Producer/consumer hand-off: HTTP threads push tickets, the matchmaker thread drains them. |
-| `ScheduledExecutorService` | `MatchmakingService.scheduler` | The matchmaking tick runs every 500 ms on a dedicated daemon thread. |
-| `ExecutorService` (fixed pool of 2) | `MatchmakingService.matchSetupPool` | After a match is formed, "setup" (simulated server allocation) runs in parallel on a separate pool — multiple matches can be prepared at once without blocking the tick. |
+| `ScheduledExecutorService` (tick) | `MatchmakingService.scheduler` | The matchmaking loop runs every 500 ms on a dedicated daemon thread. |
+| `ScheduledExecutorService` (populator) | `MatchmakingService.botPopulator` | A second scheduled thread keeps the queue full of bots so the service is always alive. Target size scales with the setup pool. |
+| `ThreadPoolExecutor` (resizable) | `MatchmakingService.matchSetupPool` | Post-match work runs here. Resizable at runtime via `/api/config/setupThreads` — more workers means more matches set up in parallel. |
 | `ConcurrentHashMap` | `PlayerService.players`, `MatchmakingService.matches`, `playerToMatch`, `playerToTicket` | Lock-free reads, fine-grained writes. Lets the polling status endpoint stay fast under concurrent updates. |
-| `AtomicLong` | `nextId`, `nextMatchId`, `totalMatchesCreated` | Lock-free unique IDs and counters. |
+| `AtomicLong` | `nextId`, `nextMatchId`, `totalMatchesCreated`, `tickCount`, `botsSpawnedTotal` | Lock-free unique IDs and counters surfaced to the live stats endpoint. |
 | `ReentrantLock` | `MatchmakingService.poolLock` | Guards the sorted in-memory pool while a tick is reading, sorting, and mutating it. |
-| Daemon threads + JVM shutdown hook | `Main` | Clean shutdown without `System.exit`. |
+| `volatile` long | `lastTickDurationMs` | Cross-thread visibility for the most recent tick duration. |
+| Daemon threads + JVM shutdown hook | `Main` | Clean shutdown of all four thread pools without `System.exit`. |
 
 ### How a match forms (concurrency flow)
 
+Four independent threads cooperate around two shared structures (a `LinkedBlockingQueue` and a sorted in-memory pool guarded by a `ReentrantLock`). Producers feed the queue, the matchmaker drains and matches, the setup pool finalises in parallel.
+
 ```
-HTTP thread (POST /queue/join)        Matchmaker tick thread        Setup worker threads
-        │                                       │                            │
-        │  playerToTicket.put()                 │                            │
-        │  incoming.offer(ticket) ─────────────►│                            │
-        │                                       │  poolLock.lock()           │
-        │                                       │  drain incoming → pool     │
-        │                                       │  sort by MMR               │
-        │                                       │  find window of 10         │
-        │                                       │  build teams (snake draft) │
-        │                                       │  matches.put(...)          │
-        │                                       │  playerToMatch.put(...)    │
-        │                                       │  matchSetupPool.submit ───►│
-        │                                       │  poolLock.unlock()         │  sleep 150ms
-HTTP thread (GET /queue/status)                                              │  println(...)
-        │                                                                    │
-        │  matchFor(playerId) ─── ConcurrentHashMap read, no lock ───────────┘
-        │  returns MATCHED + match payload
+HTTP threads               Bot populator           Matchmaker tick           Setup workers
+(8-pool, producer)         (1 thread, producer)    (1 thread, consumer)      (N threads, configurable)
+   │                          │                       │                          │
+   │ playerToTicket.put       │ createBot + join      │                          │
+   │ incoming.offer(ticket) ──┴──► incoming queue ────┤                          │
+   │                                                  │  poolLock.lock           │
+   │                                                  │  drain incoming → pool   │
+   │                                                  │  sort by MMR ascending   │
+   │                                                  │  scan window of 10       │
+   │                                                  │  build teams (snake)     │
+   │                                                  │  matches.put             │
+   │                                                  │  playerToMatch.put       │
+   │                                                  │  setupPool.submit ──────►│ sleep 800 ms
+   │                                                  │  poolLock.unlock         │ println [match-setup]
+   │                                                  │                          │
+   │ GET /queue/status                                                           │
+   │  matchFor(id) ── ConcurrentHashMap read, lock-free ─────────────────────────┘
+   │  returns MATCHED + match payload
 ```
+
+Each arrow `─►` crosses a thread boundary. The shared state on those arrows uses thread-safe types only: `LinkedBlockingQueue`, `ConcurrentHashMap`, `AtomicLong`, and one `ReentrantLock` for the tick's critical section.
 
 ---
 
@@ -92,10 +99,11 @@ Matchmaking Service/
     └── src/
         ├── main.jsx, App.jsx, api.js, App.css
         └── components/
-            ├── Login.jsx                    ← enter a name
-            ├── Lobby.jsx                    ← rank / MMR, "Find Match" + "Spawn Bots"
-            ├── Queue.jsx                    ← live timer + waiting count
-            └── MatchScreen.jsx              ← two team cards, balanced MMR
+            ├── Login.jsx                    ← enter a name to register
+            ├── Lobby.jsx                    ← rank / MMR + "Find Match" button
+            ├── Queue.jsx                    ← live timer while waiting
+            ├── MatchScreen.jsx              ← two team cards, balanced MMR
+            └── LiveStats.jsx                ← always-visible sidebar showing the 4 thread pools at work
 ```
 
 ---
@@ -120,6 +128,7 @@ The server listens on `http://localhost:8080`. You should see:
 
 ```
 Matchmaker started (tick every 500 ms)
+Bot populator started (initial target 24 bots, every 500 ms)
 API listening on http://localhost:8080
 ```
 
@@ -142,12 +151,23 @@ Open <http://localhost:5173>.
 
 ### 3. Use it
 
-1. Enter a name → assigned random MMR and rank.
-2. Click **Find Match (5v5)** → enters queue.
-3. Click **+9 Bots** → spawns 9 bots near your MMR, all queued. Within ~2–3 seconds the matchmaker forms a match.
+1. Enter a name → you're assigned a random MMR and rank.
+2. The queue is **already full of bots** — the populator keeps a target population running in the background.
+3. Click **Find Match (5v5)** → you'll be matched within a second.
 4. The match screen shows both teams, balanced by MMR. **YOU** is highlighted; bots are tagged.
-5. The backend logs each created match:
-   `[match-setup] Match #1 ready — Team A 3969 MMR vs Team B 3897 MMR (diff 72)`
+5. Click **Back to Lobby** to release the match (calls `POST /api/match/leave`) and queue again.
+6. The backend logs each match formation:
+   `[match-setup] Match #1 ready — Team A 7250 MMR vs Team B 7180 MMR (diff 70)`
+
+### 4. See the parallelism
+
+The sidebar shows a **Live System Activity** panel with the four thread pools, plus a dropdown to **resize the match-setup pool live** (1, 2, 4, 8). Switch from 1 to 8 workers and watch:
+
+- the capacity bar widen from 1 cell to 8 cells,
+- the green pulse dots light up simultaneously (multiple setups in parallel),
+- the **matches formed** counter accelerate noticeably (~6× faster at pool=8 vs pool=1).
+
+The queue target scales with the pool size, so larger pools always have enough backlog to keep every worker busy.
 
 ---
 
@@ -158,9 +178,10 @@ Open <http://localhost:5173>.
 | POST | `/api/players` | `{"name": "..."}` | `{id, name, mmr, rank, bot}` |
 | POST | `/api/queue/join` | `{"playerId": 1}` | `{"queued": true}` |
 | POST | `/api/queue/leave` | `{"playerId": 1}` | `{"removed": true}` |
-| GET | `/api/queue/status` | `?playerId=1` | `{state: IDLE\|QUEUED\|MATCHED, queueTimeMs, waiting, match?}` |
-| POST | `/api/bots/spawn` | `{"count": 9, "nearMmr": 1500}` | `{spawned: [...]}` |
-| GET | `/api/stats` | — | `{waiting, totalMatches, activeMatches}` |
+| GET  | `/api/queue/status` | `?playerId=1` | `{state: IDLE\|QUEUED\|MATCHED, queueTimeMs, match?}` |
+| POST | `/api/match/leave` | `{"playerId": 1}` | `{"released": true}` — clears the player→match mapping so the next status poll returns `IDLE`. |
+| GET  | `/api/stats` | — | `{waiting, totalMatches, activeMatches, tickCount, lastTickMs, botsSpawned, httpActive, httpSize, setupActive, setupSize}` |
+| POST | `/api/config/setupThreads` | `{"size": 4}` | `{"size": 4}` — live resize of the match-setup pool (1..16). |
 
 CORS is wide-open (`*`) so the Vite dev server can talk to it directly.
 
@@ -168,10 +189,11 @@ CORS is wide-open (`*`) so the Vite dev server can talk to it directly.
 
 ## Why this is parallel programming
 
-Three independent things happen concurrently every time you use the service:
+Four independent thread pools cooperate every time you use the service:
 
-1. **HTTP requests** run in parallel on the 8-thread pool. Two browsers can register, queue, and poll at the same time without blocking each other.
-2. **The matchmaker tick** runs on its own thread every 500 ms, completely independent of the HTTP layer. It reads from a thread-safe queue that HTTP handlers write to.
-3. **Match setup** runs on a third pool. Each formed match is "set up" in parallel — if 5 matches form on the same tick, all 5 setup tasks run concurrently on the 2-worker pool.
+1. **HTTP request pool (8 workers).** Multiple browsers can register, queue, and poll at the same time without blocking each other.
+2. **Matchmaker tick (1 thread).** Runs the matching loop every 500 ms, completely independent of the HTTP layer. It reads from a thread-safe queue that the HTTP handlers and the bot populator both write to.
+3. **Bot populator (1 thread).** Keeps the queue continuously populated so the matchmaker always has material to work with. Target size and refill rate scale with the size of the setup pool.
+4. **Match-setup pool (1–16 workers, configurable live).** Each formed match is "set up" here. With one worker, matches set up one at a time; with eight, eight matches set up simultaneously. The user can resize this pool from the UI dropdown and watch the throughput change.
 
-The state shared across these threads (player registry, match registry, the player→match index) uses `ConcurrentHashMap` everywhere except the sorted pool inside the tick, which is guarded by a `ReentrantLock` because it's read, sorted, and mutated in one critical section.
+State shared across these threads uses `ConcurrentHashMap` everywhere except the sorted in-memory pool inside the tick, which is guarded by a `ReentrantLock` because it is read, sorted, and mutated in one critical section. Counters like the tick count, total matches, and bots spawned are `AtomicLong` so the `/api/stats` endpoint can read them without contention.

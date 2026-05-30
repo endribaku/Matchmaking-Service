@@ -107,7 +107,7 @@ def card(slide, left, top, width, height, *, fill=BG2, border=BORDER):
 
 # ---- slides ---------------------------------------------------------------
 
-TOTAL = 10  # filled in after we know the count; kept manual for clarity
+TOTAL = 11  # filled in after we know the count; kept manual for clarity
 
 def slide_title():
     s = add_slide()  # no page number on cover
@@ -232,8 +232,97 @@ def slide_components():
         text(s, x + Inches(0.4), y + Inches(1.25), cw - Inches(0.6), Inches(0.95),
              desc, size=14, color=FG, line_spacing=1.3)
 
-def slide_primitives():
+def slide_pipeline():
     s = add_slide(5, TOTAL)
+    title_block(s, "PIPELINE", "How a player flows through the thread pools")
+
+    text(s, Inches(0.6), Inches(1.95), Inches(12), Inches(0.5),
+         "Four threads, two shared structures. Every horizontal arrow crosses a thread boundary.",
+         size=15, color=MUTED)
+
+    # 4 stage layout: producers → queue → matchmaker → setup workers
+    lane_w  = Inches(2.75)
+    arrow_w = Inches(0.45)
+    margin  = Inches(0.5)
+    gap     = Inches(0.05)
+
+    y_head = Inches(2.65)
+    y_box  = Inches(3.05)
+    box_h  = Inches(2.7)
+
+    def lane_x(i):
+        return margin + i * (lane_w + arrow_w + 2 * gap)
+
+    def stage(i, kicker, kicker_color, title, body_lines, fill=BG2):
+        x = lane_x(i)
+        # kicker
+        text(s, x, y_head, lane_w, Inches(0.32),
+             kicker, size=11, color=kicker_color, bold=True, align=PP_ALIGN.CENTER)
+        # box
+        card(s, x, y_box, lane_w, box_h, fill=fill)
+        # title inside box
+        text(s, x + Inches(0.15), y_box + Inches(0.2), lane_w - Inches(0.3), Inches(0.45),
+             title, size=15, color=FG, bold=True, align=PP_ALIGN.CENTER)
+        # divider
+        bar = s.shapes.add_shape(MSO_SHAPE.RECTANGLE,
+            x + Inches(0.7), y_box + Inches(0.78), lane_w - Inches(1.4), Inches(0.02))
+        bar.fill.solid(); bar.fill.fore_color.rgb = ACCENT
+        bar.line.fill.background(); bar.shadow.inherit = False
+        # body lines
+        text(s, x + Inches(0.2), y_box + Inches(1.0), lane_w - Inches(0.4),
+             box_h - Inches(1.1),
+             body_lines, size=12, color=FG, line_spacing=1.45)
+
+    def arrow(i):
+        # arrow between stage i and stage i+1
+        x = lane_x(i) + lane_w + gap
+        y = y_box + box_h / 2 - Inches(0.2)
+        a = s.shapes.add_shape(MSO_SHAPE.RIGHT_ARROW, x, y, arrow_w, Inches(0.4))
+        a.fill.solid(); a.fill.fore_color.rgb = ACCENT
+        a.line.fill.background(); a.shadow.inherit = False
+
+    stage(0, "1 — PRODUCERS", ACCENT, "HTTP join + populator", [
+        "• 8 HTTP workers push tickets",
+        "  when players click Find Match",
+        "• Bot populator pushes bots",
+        "  every 500 ms to keep queue full",
+    ])
+    arrow(0)
+    stage(1, "2 — SHARED QUEUE", GOOD, "LinkedBlockingQueue", [
+        "• Thread-safe FIFO",
+        "• Producers call offer()",
+        "• Consumer (matchmaker)",
+        "  calls poll() once per tick",
+    ], fill=BG3)
+    arrow(1)
+    stage(2, "3 — MATCHMAKER TICK", ACCENT, "1 thread · every 500 ms", [
+        "• Drain queue → sorted pool",
+        "• Sort by MMR ascending",
+        "• Sliding window of 10",
+        "• Snake-draft team balance",
+        "• matches.put + setupPool.submit",
+    ])
+    arrow(2)
+    stage(3, "4 — SETUP POOL", ACCENT, "N workers · resizable live", [
+        "• Each worker prepares one match",
+        "  (simulated 800 ms allocation)",
+        "• With pool size N, up to N matches",
+        "  set up at the same time",
+        "• Dropdown: 1 / 2 / 4 / 8",
+    ])
+
+    # Bottom callout: status read path (lock-free)
+    y_status = Inches(6.15)
+    text(s, Inches(0.6), y_status, Inches(12), Inches(0.32),
+         "PARALLEL READ PATH", size=11, color=ACCENT, bold=True)
+    card(s, Inches(0.6), y_status + Inches(0.35), Inches(12.1), Inches(0.7), fill=BG2)
+    text(s, Inches(0.9), y_status + Inches(0.5), Inches(11.5), Inches(0.45),
+         "GET /api/queue/status  →  ConcurrentHashMap.get(playerId)  →  match payload  "
+         "(no lock; all polls in parallel)",
+         size=14, color=FG, font=MONO, align=PP_ALIGN.CENTER)
+
+def slide_primitives():
+    s = add_slide(6, TOTAL)
     title_block(s, "CONCURRENCY", "java.util.concurrent primitives used")
 
     rows = [
@@ -261,7 +350,7 @@ def slide_primitives():
              desc, size=14, color=FG)
 
 def slide_algorithm():
-    s = add_slide(6, TOTAL)
+    s = add_slide(7, TOTAL)
     title_block(s, "ALGORITHM", "How the matchmaker forms a match")
 
     text(s, Inches(0.6), Inches(1.95), Inches(12), Inches(0.5),
@@ -288,7 +377,7 @@ def slide_algorithm():
              desc, size=15, color=FG)
 
 def slide_balance():
-    s = add_slide(7, TOTAL)
+    s = add_slide(8, TOTAL)
     title_block(s, "TEAM BALANCE", "Snake draft keeps teams fair")
 
     text(s, Inches(0.6), Inches(1.95), Inches(12), Inches(0.5),
@@ -330,7 +419,7 @@ def slide_balance():
          size=14, color=MUTED, align=PP_ALIGN.CENTER)
 
 def slide_ui():
-    s = add_slide(8, TOTAL)
+    s = add_slide(9, TOTAL)
     title_block(s, "INTERFACE", "Live parallelism, visible in the UI")
 
     text(s, Inches(0.6), Inches(1.95), Inches(12), Inches(0.5),
@@ -395,7 +484,7 @@ def slide_ui():
         ry += Inches(0.55)
 
 def slide_run():
-    s = add_slide(9, TOTAL)
+    s = add_slide(10, TOTAL)
     title_block(s, "RUN", "How to run the demo")
 
     # Step 1
@@ -431,7 +520,7 @@ def slide_run():
              "•  " + b, size=12, color=FG)
 
 def slide_summary():
-    s = add_slide(10, TOTAL)
+    s = add_slide(11, TOTAL)
     title_block(s, "SUMMARY", "What this project demonstrates")
 
     points = [
@@ -467,6 +556,7 @@ slide_title()
 slide_what()
 slide_stack()
 slide_components()
+slide_pipeline()
 slide_primitives()
 slide_algorithm()
 slide_balance()
